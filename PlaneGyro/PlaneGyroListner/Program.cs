@@ -14,6 +14,8 @@ internal class GyroHttpListener
 {
     private readonly HttpListener _httpListener;
     private const string Prefix = "http://localhost:8111/";
+    private const int CheckCancellationMs = 500;
+    private const int IdleMessageIntervalMs = 5000;
 
     public GyroHttpListener()
     {
@@ -57,12 +59,38 @@ internal class GyroHttpListener
 
     private async Task ListenAsync(CancellationToken cancellationToken)
     {
+        var lastIdleMessageTime = DateTime.Now;
+
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
-                var context = await _httpListener.GetContextAsync().ConfigureAwait(false);
-                _ = HandleRequestAsync(context, cancellationToken);
+                var getContextTask = _httpListener.GetContextAsync();
+                var delayTask = Task.Delay(CheckCancellationMs, cancellationToken);
+
+                var completedTask = await Task.WhenAny(getContextTask, delayTask).ConfigureAwait(false);
+
+                if (completedTask == getContextTask)
+                {
+                    var context = await getContextTask.ConfigureAwait(false);
+                    lastIdleMessageTime = DateTime.Now;
+                    _ = HandleRequestAsync(context, cancellationToken);
+                }
+                else
+                {
+                    var timeSinceLastMessage = DateTime.Now - lastIdleMessageTime;
+                    if (timeSinceLastMessage.TotalMilliseconds >= IdleMessageIntervalMs)
+                    {
+                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Waiting for API service...");
+                        lastIdleMessageTime = DateTime.Now;
+                    }
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (ObjectDisposedException)
             {
@@ -70,7 +98,6 @@ internal class GyroHttpListener
             }
             catch (HttpListenerException ex) when (ex.ErrorCode == 995)
             {
-                // Operation aborted - listener was stopped
                 break;
             }
             catch (Exception ex)
