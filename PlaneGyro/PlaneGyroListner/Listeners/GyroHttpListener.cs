@@ -1,13 +1,8 @@
-ï»¿using System.Net;
-using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
-using PlaneGyroListner.Listeners;
+using System.Net;
+using PlaneGyroListner.Logging;
+using PlaneGyroListner.Models;
 
-const string ListenerAddress = "http://localhost:8111";
-var listener = new GyroHttpListener();
-
-await listener.StartAsync();
+namespace PlaneGyroListner.Listeners;
 
 /// <summary>
 /// HTTP listener for gyroscope data on localhost:8111.
@@ -121,7 +116,7 @@ internal class GyroHttpListener
 
             if (!string.IsNullOrWhiteSpace(content))
             {
-                var gyroData = JsonSerializer.Deserialize<GyroData>(content);
+                var gyroData = System.Text.Json.JsonSerializer.Deserialize<GyroData>(content);
                 if (gyroData != null)
                 {
                     DisplayGyroData(gyroData);
@@ -132,7 +127,7 @@ internal class GyroHttpListener
             context.Response.StatusCode = 200;
             context.Response.Close();
         }
-        catch (JsonException ex)
+        catch (System.Text.Json.JsonException ex)
         {
             Console.WriteLine($"JSON parse error: {ex.Message}");
             context.Response.StatusCode = 400;
@@ -148,72 +143,6 @@ internal class GyroHttpListener
 
     private static void DisplayGyroData(GyroData data)
     {
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Gyro - X: {data.X:F2}Â° Y: {data.Y:F2}Â° Z: {data.Z:F2}Â°");
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Gyro - X: {data.X:F2}° Y: {data.Y:F2}° Z: {data.Z:F2}°");
     }
 }
-
-/// <summary>
-/// Logs gyroscope data to a JSON Lines file with 100ms sampling period.
-/// </summary>
-internal class GyroDataLogger : IDisposable
-{
-    private readonly string _logFilePath;
-    private readonly StreamWriter _writer;
-    private DateTime _lastLogTime;
-    private const int SamplingIntervalMs = 100;
-
-    public GyroDataLogger()
-    {
-        var testDataDirectory = Path.Combine(AppContext.BaseDirectory, "..", "..", "TestData");
-        var logsDirectory = Path.Combine(testDataDirectory, "logs");
-        Directory.CreateDirectory(logsDirectory);
-
-        var timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-        _logFilePath = Path.Combine(logsDirectory, $"gyro_data_{timestamp}.jsonl");
-
-        _writer = new StreamWriter(_logFilePath, append: true, Encoding.UTF8, bufferSize: 4096);
-        _lastLogTime = DateTime.Now;
-
-        Console.WriteLine($"Data logging started: {_logFilePath}\n");
-    }
-
-    public void LogData(GyroData data)
-    {
-        var now = DateTime.Now;
-        var timeSinceLastLog = (now - _lastLogTime).TotalMilliseconds;
-
-        if (timeSinceLastLog >= SamplingIntervalMs)
-        {
-            var logEntry = new GyroLogEntry(now, data.X, data.Y, data.Z);
-            var json = JsonSerializer.Serialize(logEntry);
-            _writer.WriteLine(json);
-            _lastLogTime = now;
-        }
-    }
-
-    public void Dispose()
-    {
-        _writer?.Flush();
-        _writer?.Dispose();
-        Console.WriteLine($"Data logging stopped. File saved: {_logFilePath}");
-    }
-}
-
-/// <summary>
-/// Represents a single gyroscope data log entry.
-/// </summary>
-internal record GyroLogEntry(
-    [property: JsonPropertyName("timestamp")] DateTime Timestamp,
-    [property: JsonPropertyName("x")] float X,
-    [property: JsonPropertyName("y")] float Y,
-    [property: JsonPropertyName("z")] float Z
-);
-
-/// <summary>
-/// Represents gyroscope data from the plane API.
-/// </summary>
-internal record GyroData(
-    [property: JsonPropertyName("x")] float X,
-    [property: JsonPropertyName("y")] float Y,
-    [property: JsonPropertyName("z")] float Z
-);
