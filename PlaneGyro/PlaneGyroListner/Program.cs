@@ -54,90 +54,164 @@ var stateEndpoint = new Uri("http://localhost:8111/state");
 
 Task indicatorsTask;
 Task stateTask;
+SerialPort? port = null;
+object portLock = new object();
+string? latestIndicatorsRaw = null;
+string? latestStateRaw = null;
+object latestLock = new object();
 
-if (orientationDemo)
+if (!string.IsNullOrWhiteSpace(serialPortName))
 {
-    Console.WriteLine("Orientation demo mode enabled. Printing pitch/roll/yaw derived from telemetry.");
+    port = new SerialPort(serialPortName, 115200)
+    {
+        NewLine = "\n",
+        DtrEnable = true,
+        RtsEnable = true
+    };
 
-    indicatorsTask = telemetryClient.StartPollingAsync(
-        indicatorsEndpoint,
-        raw =>
+    try
+    {
+        port.Open();
+        Console.WriteLine($"Serial port {serialPortName} opened.");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to open serial port {serialPortName}: {ex.Message}");
+        port = null;
+    }
+}
+
+// consume telemetry streams and update latest raw values
+indicatorsTask = Task.Run(async () =>
+{
+    await foreach (var raw in telemetryClient.StreamAsync(indicatorsEndpoint, cts.Token).ConfigureAwait(false))
+    {
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Raw JSON received from {indicatorsEndpoint} ({raw.Length} chars)");
+
+        if (logToFile)
         {
-            if (logToFile)
+            indicatorsLogger!.LogRawJson(raw);
+        }
+
+        lock (latestLock)
+        {
+            latestIndicatorsRaw = raw;
+        }
+    }
+}, cts.Token);
+
+stateTask = Task.Run(async () =>
+{
+    await foreach (var raw in telemetryClient.StreamAsync(stateEndpoint, cts.Token).ConfigureAwait(false))
+    {
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Raw JSON received from {stateEndpoint} ({raw.Length} chars)");
+
+        if (logToFile)
+        {
+            stateLogger!.LogRawJson(raw);
+        }
+
+        lock (latestLock)
+        {
+            latestStateRaw = raw;
+        }
+    }
+}, cts.Token);
+
+// start a sender loop that composes payloads and writes to serial port
+Task? senderTask = null;
+if (port is not null)
+{
+    senderTask = Task.Run(async () =>
+    {
+        var interval = 100;
+        while (!cts.Token.IsCancellationRequested)
+        {
+            string? indRaw;
+            string? stRaw;
+            lock (latestLock)
             {
-                indicatorsLogger!.LogRawJson(raw);
+                indRaw = latestIndicatorsRaw;
+                stRaw = latestStateRaw;
+            }
+
+            double pitch = 0, roll = 0, yaw = 0;
+            int flaps = 0;
+            int gear = 0; // default Up
+
+            // try indicators first for orientation and flaps
+            if (!string.IsNullOrWhiteSpace(indRaw))
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(indRaw);
+                    var orientation = OrientationExtractor.FromJson(doc.RootElement);
+                    pitch = orientation.PitchDeg;
+                    roll = orientation.RollDeg;
+                    yaw = orientation.YawDeg;
+                }
+                catch (JsonException)
+                {
+                }
+            }
+
+            // if state available, prefer its orientation mapping and flaps
+            if (!string.IsNullOrWhiteSpace(stRaw))
+            {
+                // Try to deserialize to State if possible
+                try
+                {
+                    State state = JsonSerializer.Deserialize<State>(stRaw);
+                    flaps = FlapsExtractor.FromPercent(state.FlapsPercent);
+                    gear = GearExtractor.FromPercent(state.GearPercent);
+                }
+                catch
+                {
+                    // ignore deserialization errors
+                }               
+            }
+
+            var payload = new { pitch, roll, yaw, flaps, gear };
+            var json = JsonSerializer.Serialize(payload);
+
+            try
+            {
+                lock (portLock)
+                {
+                    port.WriteLine(json);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to write payload to serial port: {ex.Message}");
             }
 
             try
             {
-                using var doc = JsonDocument.Parse(raw);
-                var orientation = OrientationExtractor.FromJson(doc.RootElement);
-
-                Console.WriteLine(
-                    $"[{DateTime.Now:HH:mm:ss.fff}] Orientation - " +
-                    $"Pitch: {orientation.PitchDeg:F2}° " +
-                    $"Roll: {orientation.RollDeg:F2}° " +
-                    $"Yaw: {orientation.YawDeg:F2}°");
-
-                if (logToFile)
-                {
-                    indicatorsLogger!.LogOrientation(orientation);
-                }
+                await Task.Delay(interval, cts.Token).ConfigureAwait(false);
             }
-            catch (JsonException)
+            catch (OperationCanceledException)
             {
-                // ignore malformed JSON in demo mode
+                break;
             }
-        },
-        cts.Token);
-
-    stateTask = telemetryClient.StartPollingAsync(
-        stateEndpoint,
-        raw =>
-        {
-            if (logToFile)
-            {
-                stateLogger!.LogRawJson(raw);
-            }
-        },
-        cts.Token);
-}
-else
-{
-    indicatorsTask = telemetryClient.StartPollingAsync(
-        indicatorsEndpoint,
-        raw =>
-        {
-            Console.WriteLine(
-                $"[{DateTime.Now:HH:mm:ss.fff}] Raw JSON received from {indicatorsEndpoint} ({raw.Length} chars)");
-
-            if (logToFile)
-            {
-                indicatorsLogger!.LogRawJson(raw);
-            }
-        },
-        cts.Token);
-
-    stateTask = telemetryClient.StartPollingAsync(
-        stateEndpoint,
-        raw =>
-        {
-            Console.WriteLine(
-                $"[{DateTime.Now:HH:mm:ss.fff}] Raw JSON received from {stateEndpoint} ({raw.Length} chars)");
-
-            if (logToFile)
-            {
-                stateLogger!.LogRawJson(raw);
-            }
-        },
-        cts.Token);
+        }
+    }, cts.Token);
 }
 
-// run both pollers concurrently until cancellation
-await Task.WhenAll(indicatorsTask, stateTask);
+// run both pollers and optional sender concurrently until cancellation
+var tasks = new List<Task> { indicatorsTask, stateTask };
+if (senderTask is not null) tasks.Add(senderTask);
+await Task.WhenAll(tasks);
 
 indicatorsLogger?.Dispose();
 stateLogger?.Dispose();
+if (port is not null)
+{
+    lock (portLock)
+    {
+        try { port.Close(); } catch { }
+    }
+}
 
 static async Task RunSerialTestModeAsync(string serialPortName, CancellationToken cancellationToken)
 {

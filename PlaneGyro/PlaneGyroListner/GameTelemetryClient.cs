@@ -1,5 +1,6 @@
 using System.Text.Json;
 using PlaneGyroListner.Logging;
+using System.Runtime.CompilerServices;
 
 namespace PlaneGyroListner;
 
@@ -18,30 +19,21 @@ internal sealed class GameTelemetryClient : IDisposable
     }
 
     /// <summary>
-    /// Starts polling the specified endpoint until cancellation is requested.
-    /// For each successful response, invokes <paramref name="onJson"/> with the raw JSON body.
+    /// Streams raw JSON responses from the endpoint as an async sequence.
+    /// Use `await foreach (var raw in client.StreamAsync(..., ct))` to consume.
     /// </summary>
-    public async Task StartPollingAsync(
+    public async IAsyncEnumerable<string> StreamAsync(
         Uri endpoint,
-        Action<string> onJson,
-        CancellationToken cancellationToken)
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        Console.WriteLine($"Polling {endpoint} every {_pollIntervalMs}ms");
+        Console.WriteLine($"Streaming {endpoint} every {_pollIntervalMs}ms");
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            HttpResponseMessage? resp = null;
             try
             {
-                using var resp = await _client.GetAsync(endpoint, cancellationToken).ConfigureAwait(false);
-                if (resp.IsSuccessStatusCode)
-                {
-                    var raw = await resp.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-                    onJson(raw);
-                }
-                else
-                {
-                    Console.WriteLine($"HTTP {resp.StatusCode} from {endpoint}");
-                }
+                resp = await _client.GetAsync(endpoint, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -49,7 +41,20 @@ internal sealed class GameTelemetryClient : IDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Poll error from {endpoint}: {ex.Message}");
+                Console.WriteLine($"Stream error from {endpoint}: {ex.Message}");
+            }
+
+            if (resp != null)
+            {
+                if (resp.IsSuccessStatusCode)
+                {
+                    var raw = await resp.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                    yield return raw;
+                }
+                else
+                {
+                    Console.WriteLine($"HTTP {resp.StatusCode} from {endpoint}");
+                }
             }
 
             try
