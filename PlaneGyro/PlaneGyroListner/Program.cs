@@ -1,219 +1,257 @@
-﻿using System.Net;
-using System.Text;
+using System.IO.Ports;
 using System.Text.Json;
-using System.Text.Json.Serialization;
-using PlaneGyroListner.Listeners;
+using PlaneGyroListner;
+using PlaneGyroListner.Logging;
+using PlaneGyroListner.Models;
 
-const string ListenerAddress = "http://localhost:8111";
-var listener = new GyroHttpListener();
+// "HttpListener" on the same port is intentionally removed because another service
+// is already exposing JSON on that port. Use the HTTP poller below to read data
+// from the existing service instead of starting a listener that would conflict.
 
-await listener.StartAsync();
+var logToFile = args.Any(a =>
+    string.Equals(a, "--logToFile", StringComparison.OrdinalIgnoreCase));
 
-/// <summary>
-/// HTTP listener for gyroscope data on localhost:8111.
-/// </summary>
-internal class GyroHttpListener
+var orientationDemo = args.Any(a =>
+    string.Equals(a, "--orientation-demo", StringComparison.OrdinalIgnoreCase));
+
+var testMode = args.Any(a =>
+    string.Equals(a, "--test-mode", StringComparison.OrdinalIgnoreCase));
+
+var serialPortArg = args.FirstOrDefault(a =>
+    a.StartsWith("--serial-port=", StringComparison.OrdinalIgnoreCase));
+var serialPortName = serialPortArg is null
+    ? null
+    : serialPortArg.Substring("--serial-port=".Length);
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
+
+if (testMode)
 {
-    private readonly HttpListener _httpListener;
-    private readonly GyroDataLogger _dataLogger;
-    private const string Prefix = "http://localhost:8111/";
-    private const int CheckCancellationMs = 500;
-    private const int IdleMessageIntervalMs = 5000;
-
-    public GyroHttpListener()
+    if (string.IsNullOrWhiteSpace(serialPortName))
     {
-        _httpListener = new HttpListener();
-        _httpListener.Prefixes.Add(Prefix);
-        _dataLogger = new GyroDataLogger();
+        Console.WriteLine("Test mode requires --serial-port=COMx argument.");
+        return;
     }
 
-    public async Task StartAsync()
-    {
-        Console.WriteLine("PlaneGyroListener started...");
-        Console.WriteLine($"Listening on {Prefix}");
-        Console.WriteLine("Press Ctrl+C to exit\n");
+    await RunSerialTestModeAsync(serialPortName, cts.Token);
+    return;
+}
 
-        _httpListener.Start();
+GyroDataLogger? indicatorsLogger = null;
+GyroDataLogger? stateLogger = null;
 
-        using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (s, e) =>
+if (logToFile)
+{
+    indicatorsLogger = new GyroDataLogger("indicators");
+    stateLogger = new GyroDataLogger("state");
+}
+
+using var telemetryClient = new GameTelemetryClient(pollIntervalMs: 100);
+
+var indicatorsEndpoint = new Uri("http://localhost:8111/indicators");
+var stateEndpoint = new Uri("http://localhost:8111/state");
+
+Task indicatorsTask;
+Task stateTask;
+
+if (orientationDemo)
+{
+    Console.WriteLine("Orientation demo mode enabled. Printing pitch/roll/yaw derived from telemetry.");
+
+    indicatorsTask = telemetryClient.StartPollingAsync(
+        indicatorsEndpoint,
+        raw =>
         {
-            e.Cancel = true;
-            cts.Cancel();
-        };
+            if (logToFile)
+            {
+                indicatorsLogger!.LogRawJson(raw);
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(raw);
+                var orientation = OrientationExtractor.FromJson(doc.RootElement);
+
+                Console.WriteLine(
+                    $"[{DateTime.Now:HH:mm:ss.fff}] Orientation - " +
+                    $"Pitch: {orientation.PitchDeg:F2}° " +
+                    $"Roll: {orientation.RollDeg:F2}° " +
+                    $"Yaw: {orientation.YawDeg:F2}°");
+
+                if (logToFile)
+                {
+                    indicatorsLogger!.LogOrientation(orientation);
+                }
+            }
+            catch (JsonException)
+            {
+                // ignore malformed JSON in demo mode
+            }
+        },
+        cts.Token);
+
+    stateTask = telemetryClient.StartPollingAsync(
+        stateEndpoint,
+        raw =>
+        {
+            if (logToFile)
+            {
+                stateLogger!.LogRawJson(raw);
+            }
+        },
+        cts.Token);
+}
+else
+{
+    indicatorsTask = telemetryClient.StartPollingAsync(
+        indicatorsEndpoint,
+        raw =>
+        {
+            Console.WriteLine(
+                $"[{DateTime.Now:HH:mm:ss.fff}] Raw JSON received from {indicatorsEndpoint} ({raw.Length} chars)");
+
+            if (logToFile)
+            {
+                indicatorsLogger!.LogRawJson(raw);
+            }
+        },
+        cts.Token);
+
+    stateTask = telemetryClient.StartPollingAsync(
+        stateEndpoint,
+        raw =>
+        {
+            Console.WriteLine(
+                $"[{DateTime.Now:HH:mm:ss.fff}] Raw JSON received from {stateEndpoint} ({raw.Length} chars)");
+
+            if (logToFile)
+            {
+                stateLogger!.LogRawJson(raw);
+            }
+        },
+        cts.Token);
+}
+
+// run both pollers concurrently until cancellation
+await Task.WhenAll(indicatorsTask, stateTask);
+
+indicatorsLogger?.Dispose();
+stateLogger?.Dispose();
+
+static async Task RunSerialTestModeAsync(string serialPortName, CancellationToken cancellationToken)
+{
+    Console.WriteLine($"Test mode enabled. Using serial port: {serialPortName}");
+
+    // Locate TestData directory relative to the build output directory.
+    // TestData is copied next to the executable by the csproj settings.
+    var baseDir = AppContext.BaseDirectory;
+    var testDataDirectory = Path.Combine(baseDir, "TestData");
+    var stateFilePath = Path.Combine(testDataDirectory, "state_data_2026-03-10_23-33-33.jsonl");
+
+    if (!File.Exists(stateFilePath))
+    {
+        Console.WriteLine($"State data file not found at {stateFilePath}");
+        return;
+    }
+
+    // Load all non-empty JSON lines and convert each to an orientation JSON payload
+    var orientationMessages = new List<string>();
+
+    foreach (var line in File.ReadLines(stateFilePath))
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            continue;
+        }
 
         try
         {
-            await ListenAsync(cts.Token);
+            var state = JsonSerializer.Deserialize<State?>(line);
+            if (state is null)
+            {
+                continue;
+            }
+
+            var orientation = OrientationExtractor.FromState(state.Value);
+
+            var payload = new
+            {
+                pitch = orientation.PitchDeg,
+                roll = 0.0,
+                yaw = 0.0
+            };
+
+            var json = JsonSerializer.Serialize(payload);
+            orientationMessages.Add(json);
         }
-        catch (OperationCanceledException)
+        catch
         {
-            Console.WriteLine("\nListener stopped gracefully.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error: {ex.Message}");
-        }
-        finally
-        {
-            _httpListener.Stop();
-            _httpListener.Close();
-            _dataLogger.Dispose();
+            // Skip malformed lines
         }
     }
 
-    private async Task ListenAsync(CancellationToken cancellationToken)
+    if (orientationMessages.Count == 0)
     {
-        var lastIdleMessageTime = DateTime.Now;
+        Console.WriteLine("No valid state samples found in TestData file.");
+        return;
+    }
+
+    Console.WriteLine($"Loaded {orientationMessages.Count} orientation samples from TestData.");
+
+    using var port = new SerialPort(serialPortName, 115200)
+    {
+        NewLine = "\n",
+        DtrEnable = true,
+        RtsEnable = true
+    };
+
+    try
+    {
+        port.Open();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to open serial port {serialPortName}: {ex.Message}");
+        return;
+    }
+
+    Console.WriteLine("Serial port opened. Replaying orientation JSON sequence until cancelled (Ctrl+C).");
+
+    try
+    {
+        var index = 0;
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            var message = orientationMessages[index];
+            port.WriteLine(message);
+            Console.WriteLine(
+                $"[{DateTime.Now:HH:mm:ss.fff}] Sent: {message}");
+
+            index++;
+            if (index >= orientationMessages.Count)
+            {
+                index = 0;
+            }
+
             try
             {
-                var getContextTask = _httpListener.GetContextAsync();
-                var delayTask = Task.Delay(CheckCancellationMs, cancellationToken);
-
-                var completedTask = await Task.WhenAny(getContextTask, delayTask).ConfigureAwait(false);
-
-                if (completedTask == getContextTask)
-                {
-                    var context = await getContextTask.ConfigureAwait(false);
-                    lastIdleMessageTime = DateTime.Now;
-                    _ = HandleRequestAsync(context, cancellationToken);
-                }
-                else
-                {
-                    var timeSinceLastMessage = DateTime.Now - lastIdleMessageTime;
-                    if (timeSinceLastMessage.TotalMilliseconds >= IdleMessageIntervalMs)
-                    {
-                        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Waiting for API service...");
-                        lastIdleMessageTime = DateTime.Now;
-                    }
-                }
-
-                cancellationToken.ThrowIfCancellationRequested();
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
-                throw;
-            }
-            catch (ObjectDisposedException)
-            {
                 break;
-            }
-            catch (HttpListenerException ex) when (ex.ErrorCode == 995)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error accepting request: {ex.Message}");
             }
         }
     }
-
-    private async Task HandleRequestAsync(HttpListenerContext context, CancellationToken cancellationToken)
+    finally
     {
-        try
+        if (port.IsOpen)
         {
-            using var reader = new StreamReader(context.Request.InputStream);
-            var content = await reader.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
-
-            if (!string.IsNullOrWhiteSpace(content))
-            {
-                var gyroData = JsonSerializer.Deserialize<GyroData>(content);
-                if (gyroData != null)
-                {
-                    DisplayGyroData(gyroData);
-                    _dataLogger.LogData(gyroData);
-                }
-            }
-
-            context.Response.StatusCode = 200;
-            context.Response.Close();
+            port.Close();
         }
-        catch (JsonException ex)
-        {
-            Console.WriteLine($"JSON parse error: {ex.Message}");
-            context.Response.StatusCode = 400;
-            context.Response.Close();
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Request handling error: {ex.Message}");
-            context.Response.StatusCode = 500;
-            context.Response.Close();
-        }
-    }
-
-    private static void DisplayGyroData(GyroData data)
-    {
-        Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] Gyro - X: {data.X:F2}° Y: {data.Y:F2}° Z: {data.Z:F2}°");
+        Console.WriteLine("Test mode stopped.");
     }
 }
 
-/// <summary>
-/// Logs gyroscope data to a JSON Lines file with 100ms sampling period.
-/// </summary>
-internal class GyroDataLogger : IDisposable
-{
-    private readonly string _logFilePath;
-    private readonly StreamWriter _writer;
-    private DateTime _lastLogTime;
-    private const int SamplingIntervalMs = 100;
-
-    public GyroDataLogger()
-    {
-        var testDataDirectory = Path.Combine(AppContext.BaseDirectory, "..", "..", "TestData");
-        var logsDirectory = Path.Combine(testDataDirectory, "logs");
-        Directory.CreateDirectory(logsDirectory);
-
-        var timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
-        _logFilePath = Path.Combine(logsDirectory, $"gyro_data_{timestamp}.jsonl");
-
-        _writer = new StreamWriter(_logFilePath, append: true, Encoding.UTF8, bufferSize: 4096);
-        _lastLogTime = DateTime.Now;
-
-        Console.WriteLine($"Data logging started: {_logFilePath}\n");
-    }
-
-    public void LogData(GyroData data)
-    {
-        var now = DateTime.Now;
-        var timeSinceLastLog = (now - _lastLogTime).TotalMilliseconds;
-
-        if (timeSinceLastLog >= SamplingIntervalMs)
-        {
-            var logEntry = new GyroLogEntry(now, data.X, data.Y, data.Z);
-            var json = JsonSerializer.Serialize(logEntry);
-            _writer.WriteLine(json);
-            _lastLogTime = now;
-        }
-    }
-
-    public void Dispose()
-    {
-        _writer?.Flush();
-        _writer?.Dispose();
-        Console.WriteLine($"Data logging stopped. File saved: {_logFilePath}");
-    }
-}
-
-/// <summary>
-/// Represents a single gyroscope data log entry.
-/// </summary>
-internal record GyroLogEntry(
-    [property: JsonPropertyName("timestamp")] DateTime Timestamp,
-    [property: JsonPropertyName("x")] float X,
-    [property: JsonPropertyName("y")] float Y,
-    [property: JsonPropertyName("z")] float Z
-);
-
-/// <summary>
-/// Represents gyroscope data from the plane API.
-/// </summary>
-internal record GyroData(
-    [property: JsonPropertyName("x")] float X,
-    [property: JsonPropertyName("y")] float Y,
-    [property: JsonPropertyName("z")] float Z
-);

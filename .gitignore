@@ -1,3 +1,5 @@
 .vs
 /PlaneGyro/PlaneGyroListner/obj
 /PlaneGyro/PlaneGyroListner/bin/
+/PlaneGyro/PlaneGyroListner.Tests/bin/
+/PlaneGyro/PlaneGyroListner.Tests/obj/

@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "PlaneGyroListner": {
+      "commandName": "Project",
+      "commandLineArgs": "--test-mode --serial-port=COM3"
+    }
+  }
+}
