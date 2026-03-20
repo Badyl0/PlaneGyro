@@ -155,40 +155,59 @@ static async Task RunSerialTestModeAsync(string serialPortName, CancellationToke
         return;
     }
 
-    // Load all non-empty JSON lines and convert each to an orientation JSON payload
+    // Read the file as a stream and deserialize State objects. This uses
+    // DeserializeAsyncEnumerable which streams a top-level JSON array (or single
+    // value). It's a simpler approach — if the input is not a JSON array this
+    // may fail, but it's concise and efficient for typical JSON files.
     var orientationMessages = new List<string>();
+    int tmpFlaps = 0;
+    int lineIndex = 0;
 
-    foreach (var line in File.ReadLines(stateFilePath))
+    try
     {
-        if (string.IsNullOrWhiteSpace(line))
+        await using var fs = File.OpenRead(stateFilePath);
+        await foreach (var state in JsonSerializer.DeserializeAsyncEnumerable<State?>(fs).ConfigureAwait(false))
         {
-            continue;
-        }
-
-        try
-        {
-            var state = JsonSerializer.Deserialize<State?>(line);
             if (state is null)
             {
                 continue;
+            }
+
+            lineIndex++;
+            if (lineIndex < 50)
+            {
+                tmpFlaps = 0;
+            }
+            else if (lineIndex > 50 && lineIndex < 100)
+            {
+                tmpFlaps = 1;
+            }
+            else if (lineIndex > 100 && lineIndex < 150)
+            {
+                tmpFlaps = 2;
+            }
+            else if (lineIndex > 150)
+            {
+                tmpFlaps = 3;
             }
 
             var orientation = OrientationExtractor.FromState(state.Value);
 
             var payload = new
             {
-                pitch = orientation.PitchDeg,
+                pitch = 0.0,
                 roll = 0.0,
-                yaw = 0.0
+                yaw = 0.0,
+                flaps = tmpFlaps
             };
 
             var json = JsonSerializer.Serialize(payload);
             orientationMessages.Add(json);
         }
-        catch
-        {
-            // Skip malformed lines
-        }
+    }
+    catch (JsonException)
+    {
+        // If the JSON is malformed or not in an expected shape, fall through and report no samples.
     }
 
     if (orientationMessages.Count == 0)

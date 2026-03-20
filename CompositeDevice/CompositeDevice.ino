@@ -1,8 +1,15 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <ESP32Servo.h>
+#include <TM1638plus.h>
 
 // ===== Config =====
+#define  STROBE_TM 16 // strobe = GPIO connected to strobe line of module
+#define  CLOCK_TM 17  // clock = GPIO connected to clock line of module
+#define  DIO_TM 18 // data = GPIO connected to data line of module
+bool high_freq = false; //default false,, If using a high freq CPU > ~100 MHZ set to true.
+
+//Constructor object (GPIO STB , GPIO CLOCK , GPIO DIO, use high freq MCU)
+TM1638plus tm(STROBE_TM, CLOCK_TM , DIO_TM, high_freq);
 
 static const unsigned long SERIAL_BAUD = 115200;
 
@@ -34,18 +41,23 @@ static const unsigned long SIGNAL_TIMEOUT_MS = 2000;
 
 // ===== Data =====
 
-struct Orientation {
+struct Plane {
   float pitch;
+  float roll;
+  float yaw;
+  int flaps;
+  bool gear;
   bool  valid;
 };
 
 static char lineBuf[LINE_BUF_SIZE];
 static size_t lineIndex = 0;
 
-static Orientation targetOrientation = {0.0f, false};
+static Plane targetOrientation = {0.0f, false};
 static unsigned long lastPacketMillis = 0;
+Plane cachedPlane = {0.0f, 0.0f, 0.0f, 0, false, false};
 
-static Servo servoPitch;
+
 static AxisConfig pitchCfg = PITCH_CFG;
 static float currentServoDeg = PITCH_CFG.neutralServoDeg;
 static float targetServoDeg  = PITCH_CFG.neutralServoDeg;
@@ -69,23 +81,26 @@ static float mapPitchToServo(const AxisConfig &cfg, float deg) {
   return clampf(servoDeg, 0.0f, 180.0f);
 }
 
-bool parseOrientation(const char *line, Orientation &out) {
+bool parseOrientation(const char *line, Plane &out) {
   StaticJsonDocument<256> doc;
   DeserializationError err = deserializeJson(doc, line);
   if (err) {
     return false;
   }
+  int flaps = doc["flaps"] | 0;
+  bool gear = doc["gear"];
 
-  float pitch = doc["pitch"] | 0.0f;
-  pitch = clampf(pitch, -180.0f, 180.0f);
-
-  out.pitch = pitch;
+  out.pitch = 0.0f;
+  out.roll = 0.0f;
+  out.yaw = 0.0f;
+  out.flaps = flaps;
+  out.gear = gear;
   out.valid = true;
   return true;
 }
 
 void handleCompleteLine(const char *line) {
-  Orientation o = {0.0f, false};
+  Plane o = {0.0f, false};
   if (!parseOrientation(line, o)) {
     // Uncomment for debugging parse failures if needed:
     // Serial.print(F("Parse failed for line: "));
@@ -100,6 +115,33 @@ void handleCompleteLine(const char *line) {
 
   targetOrientation = o;
   lastPacketMillis = millis();
+    switch(o.flaps){
+      case 0:
+        tm.setLED(0, 0);
+        tm.setLED(1, 0);
+        tm.setLED(2, 0);
+        tm.setLED(3, 0);
+        break;
+      case 1:
+        tm.setLED(0, 1);
+        tm.setLED(1, 0);
+        tm.setLED(2, 0);
+        tm.setLED(3, 0);
+        break;
+      case 2:
+        tm.setLED(0, 1);
+        tm.setLED(1, 1);
+        tm.setLED(2, 0);
+        tm.setLED(3, 0);
+        break;
+      case 3:
+        tm.setLED(0, 1);
+        tm.setLED(1, 1);
+        tm.setLED(2, 1);
+        tm.setLED(3, 0);
+        break;
+    }
+    tm.setLED(7, o.gear);
 
   targetServoDeg = mapPitchToServo(pitchCfg, o.pitch);
 }
@@ -130,43 +172,19 @@ void pollSerial() {
   }
 }
 
-void updateServo() {
-  unsigned long now = millis();
-
-  // timeout → go back to neutral
-  if (lastPacketMillis > 0 && (now - lastPacketMillis) > SIGNAL_TIMEOUT_MS) {
-    targetServoDeg = pitchCfg.neutralServoDeg;
-  }
-
-  if (now - lastServoUpdateMillis < SERVO_UPDATE_INTERVAL_MS) return;
-  lastServoUpdateMillis = now;
-
-  float diff = targetServoDeg - currentServoDeg;
-  if (fabs(diff) <= MAX_SERVO_STEP_DEG) {
-    currentServoDeg = targetServoDeg;
-  } else {
-    currentServoDeg += (diff > 0 ? MAX_SERVO_STEP_DEG : -MAX_SERVO_STEP_DEG);
-  }
-
-  float outDeg = clampf(currentServoDeg, 0.0f, 180.0f);
-  servoPitch.write(outDeg);
-}
 
 // ===== Arduino lifecycle =====
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
   delay(500);
+  tm.displayBegin();
+  tm.reset();
 
   Serial.println();
   Serial.println(F("PlaneGyro ESP32 receiver (PITCH ONLY)"));
   Serial.print(F("Serial baud: ")); Serial.println(SERIAL_BAUD);
   Serial.print(F("Pitch pin: ")); Serial.println(SERVO_PITCH_PIN);
-
-  servoPitch.setPeriodHertz(50);
-  servoPitch.attach(SERVO_PITCH_PIN, SERVO_MIN_US, SERVO_MAX_US);
-
-  servoPitch.write(currentServoDeg);
 
   lastPacketMillis = 0;
   lastServoUpdateMillis = millis();
@@ -174,5 +192,4 @@ void setup() {
 
 void loop() {
   pollSerial();
-  updateServo();
 }
